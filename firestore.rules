@@ -1,0 +1,213 @@
+rules_version = '2';
+
+// IREKA HOMES — Firestore Security Rules
+// Roles: admin, senior, employee. Every check is done server-side here,
+// so a modified frontend cannot bypass the hierarchy.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function userDoc(id) { return get(/databases/$(database)/documents/users/$(id)); }
+    function me() { return userDoc(uid()).data; }
+    function hasProfile() { return signedIn() && exists(/databases/$(database)/documents/users/$(uid())); }
+    function isActive() { return hasProfile() && me().active == true; }
+    function isAdmin() { return isActive() && me().role == 'admin'; }
+    function isSenior() { return isActive() && me().role == 'senior'; }
+    function isEmployee() { return isActive() && me().role == 'employee'; }
+
+    function taskDoc(taskId) { return get(/databases/$(database)/documents/tasks/$(taskId)).data; }
+    function canAccessTask(taskId) {
+      return isAdmin()
+        || (isSenior() && (taskDoc(taskId).seniorId == uid() || taskDoc(taskId).assignedTo == uid()))
+        || (isEmployee() && taskDoc(taskId).assignedTo == uid());
+    }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // Fields the assignee (employee, or senior on an admin-assigned task) may change.
+    function employeeTaskFields() {
+      return ['status', 'progress', 'startedAt', 'completedAt', 'submittedAt',
+              'workDescription', 'timeSpentMinutes', 'attachments',
+              'selfChecked', 'selfCheckedAt', 'selfCheckedBy', 'selfChecklist',
+              'submissionCount', 'deadlineNotified', 'checklist', 'updatedAt'];
+    }
+
+    function validEmployeeTaskUpdate() {
+      return resource.data.assignedTo == uid()
+        && changed().hasOnly(employeeTaskFields())
+        && !(resource.data.status in ['approved', 'cancelled'])
+        // while waiting for review the employee cannot edit the work
+        && (resource.data.status != 'pending_review'
+            || changed().hasOnly(['deadlineNotified', 'updatedAt']))
+        && (request.resource.data.status == resource.data.status
+            || request.resource.data.status in ['in_progress', 'completed', 'pending_review'])
+        // cannot submit without the self-recheck
+        && (request.resource.data.status != 'pending_review' || request.resource.data.selfChecked == true)
+        // employees may tick checklist items but not add or remove them
+        && request.resource.data.checklist.size() == resource.data.checklist.size()
+        && request.resource.data.progress is int
+        && request.resource.data.progress >= 0 && request.resource.data.progress <= 100;
+    }
+
+    function validSeniorTaskWrite() {
+      return request.resource.data.seniorId == uid()
+        && userDoc(request.resource.data.assignedTo).data.seniorId == uid()
+        && userDoc(request.resource.data.assignedTo).data.role == 'employee';
+    }
+
+    // ---------- users ----------
+    match /users/{userId} {
+      allow read: if isAdmin()
+        || (signedIn() && uid() == userId)
+        || (isSenior() && resource.data.seniorId == uid())
+        || (isEmployee() && me().seniorId == userId);
+      allow create, delete: if isAdmin();
+      // A user may only touch harmless profile fields; role, seniorId,
+      // departmentId and active can only be changed by an admin.
+      allow update: if isAdmin()
+        || (signedIn() && uid() == userId
+            && changed().hasOnly(['phone', 'lastLoginAt', 'updatedAt']));
+    }
+
+    // ---------- departments ----------
+    match /departments/{deptId} {
+      allow read: if isActive();
+      allow write: if isAdmin();
+    }
+
+    // ---------- tasks ----------
+    match /tasks/{taskId} {
+      allow read: if isAdmin()
+        || (isSenior() && (resource.data.seniorId == uid() || resource.data.assignedTo == uid()))
+        || (isEmployee() && resource.data.assignedTo == uid());
+
+      allow create: if isAdmin()
+        || (isSenior() && validSeniorTaskWrite()
+            && request.resource.data.status == 'assigned'
+            && request.resource.data.selfChecked == false);
+
+      allow update: if isAdmin()
+        || (isSenior() && resource.data.seniorId == uid() && validSeniorTaskWrite())
+        // a senior working on a task the admin assigned to them: same limits as an employee,
+        // and only the admin can approve it
+        || (isSenior() && validEmployeeTaskUpdate())
+        || (isEmployee() && validEmployeeTaskUpdate());
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------- task sub-records (top-level, scoped by employeeId/seniorId) ----------
+    function validTaskChild() {
+      return request.resource.data.userId == uid()
+        && canAccessTask(request.resource.data.taskId)
+        && request.resource.data.employeeId == taskDoc(request.resource.data.taskId).assignedTo
+        && request.resource.data.seniorId == taskDoc(request.resource.data.taskId).seniorId;
+    }
+    function canReadTaskChild() {
+      return isAdmin()
+        || (isActive() && (resource.data.employeeId == uid() || resource.data.seniorId == uid()));
+    }
+
+    match /taskComments/{id} {
+      allow read: if canReadTaskChild();
+      allow create: if validTaskChild();
+      allow update, delete: if false;
+    }
+
+    match /taskUpdates/{id} {
+      allow read: if canReadTaskChild();
+      allow create: if validTaskChild();
+      allow update, delete: if false;
+    }
+
+    // Approval history is append-only: never overwritten, never deleted.
+    match /taskApprovals/{id} {
+      allow read: if canReadTaskChild();
+      allow create: if validTaskChild() && (
+        (request.resource.data.action in ['submitted', 'resubmitted']
+          && taskDoc(request.resource.data.taskId).assignedTo == uid())
+        || (request.resource.data.action in ['approved', 'rejected', 'revision_required']
+          && (isAdmin() || taskDoc(request.resource.data.taskId).seniorId == uid()))
+      );
+      allow update, delete: if false;
+    }
+
+    // ---------- activity logs (append-only) ----------
+    match /activityLogs/{id} {
+      allow read: if isAdmin()
+        || (isActive() && (resource.data.employeeId == uid() || resource.data.seniorId == uid()));
+      allow create: if signedIn() && request.resource.data.userId == uid();
+      allow update, delete: if false;
+    }
+
+    // ---------- notifications ----------
+    // userId == 'ADMIN' is a broadcast inbox read by every admin.
+    match /notifications/{id} {
+      allow read: if (signedIn() && resource.data.userId == uid())
+        || (resource.data.userId == 'ADMIN' && isAdmin());
+      allow create: if isActive() && request.resource.data.createdBy == uid();
+      allow update: if ((signedIn() && resource.data.userId == uid())
+          || (resource.data.userId == 'ADMIN' && isAdmin()))
+        && changed().hasOnly(['read', 'readAt']);
+      allow delete: if signedIn() && resource.data.userId == uid();
+    }
+
+    // ---------- KRA / KPI ----------
+    // Permanent per-person KPIs. Admin manages them; seniors can view;
+    // the owner sees their own and marks periods done; only admin approves.
+    match /kras/{id} {
+      allow read: if isAdmin() || isSenior() || (isActive() && resource.data.employeeId == uid());
+      allow write: if isAdmin();
+    }
+    match /kpis/{id} {
+      allow read: if isAdmin() || isSenior() || (isActive() && resource.data.employeeId == uid());
+      allow write: if isAdmin();
+    }
+    match /kpiChecks/{id} {
+      allow read: if isAdmin() || isSenior() || (isActive() && resource.data.employeeId == uid());
+      allow create: if isAdmin()
+        || (isActive() && request.resource.data.employeeId == uid()
+            && get(/databases/$(database)/documents/kpis/$(request.resource.data.kpiId)).data.employeeId == uid()
+            && request.resource.data.status in ['done', 'open']);
+      allow update: if isAdmin()
+        || (isActive() && resource.data.employeeId == uid()
+            && resource.data.status != 'approved'
+            && request.resource.data.status in ['done', 'open']
+            && changed().hasOnly(['status', 'doneBy', 'doneAt', 'updatedAt']));
+      allow delete: if isAdmin();
+    }
+
+    // ---------- performance reports ----------
+    match /performanceReports/{id} {
+      allow read: if isAdmin()
+        || (isActive() && (resource.data.employeeId == uid() || resource.data.seniorId == uid()));
+      allow create: if isAdmin()
+        || (isSenior() && request.resource.data.seniorId == uid()
+            && userDoc(request.resource.data.employeeId).data.seniorId == uid()
+            && !request.resource.data.keys().hasAny(['adminOverrideScore', 'adminOverrideRating', 'adminComments']));
+      allow update: if isAdmin()
+        || (isSenior() && resource.data.seniorId == uid()
+            && request.resource.data.seniorId == uid()
+            && !changed().hasAny(['adminOverrideScore', 'adminOverrideRating', 'adminComments', 'adminUpdatedAt', 'adminUpdatedBy']));
+      allow delete: if isAdmin();
+    }
+
+    // ---------- attendance ----------
+    match /attendance/{id} {
+      allow read: if isAdmin()
+        || (isActive() && (resource.data.userId == uid() || resource.data.seniorId == uid()));
+      allow create, update: if isActive() && request.resource.data.userId == uid();
+    }
+
+    // ---------- settings & counters ----------
+    match /settings/{id} {
+      allow read: if isActive();
+      allow write: if isAdmin();
+    }
+    match /counters/{id} {
+      allow read, write: if isAdmin() || isSenior();
+    }
+  }
+}

@@ -1,0 +1,44 @@
+rules_version = '2';
+
+// IREKA HOMES — Storage rules for task attachments.
+// Uses cross-service rules (firestore.get) so only the assigned employee,
+// the task's senior, and admins can read or upload files for a task.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function profile() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+    function task(taskId) {
+      return firestore.get(/databases/(default)/documents/tasks/$(taskId)).data;
+    }
+    function canAccess(taskId) {
+      return request.auth != null
+        && profile().active == true
+        && (profile().role == 'admin'
+            || task(taskId).assignedTo == request.auth.uid
+            || task(taskId).seniorId == request.auth.uid);
+    }
+    function allowedType() {
+      return request.resource.contentType.matches('application/pdf')
+        || request.resource.contentType.matches('image/.*')
+        || request.resource.contentType.matches('application/msword')
+        || request.resource.contentType.matches('application/vnd\\.openxmlformats-officedocument\\..*')
+        || request.resource.contentType.matches('application/vnd\\.ms-excel.*')
+        || request.resource.contentType.matches('text/csv');
+    }
+
+    match /tasks/{taskId}/{fileName} {
+      allow read: if canAccess(taskId);
+      allow create: if canAccess(taskId)
+        && request.resource.size < 20 * 1024 * 1024
+        && allowedType();
+      allow update, delete: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
